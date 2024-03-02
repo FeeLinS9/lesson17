@@ -1,0 +1,183 @@
+---
+- hosts: all
+  become: true
+  tasks:
+  - name: Set timezone to Europe/Moscow
+    community.general.timezone:
+      name: Europe/Moscow
+    notify: restart chronyd
+
+  - name: Set locale
+    command: localedef -c -i ru_RU -f UTF-8 ru_RU.UTF-8
+    
+  - name: BORGBACKUP | Install EPEL Repo package from standart repo
+    yum:
+      name: epel-release
+      state: present
+    tags:
+      - epel-package
+      - packages
+
+  - name: BORGBACKUP | Install BORGBACKUP package from EPEL Repo
+    yum:
+      name: borgbackup
+      state: latest
+    tags:
+      - borgbackup-package
+      - packages
+
+#  - name: Install ASCII package
+#    yum:
+#      name: ascii
+#      state: latest
+#    tags:
+#      - packages
+
+  handlers:
+  - name: restart chronyd
+    systemd:
+      name: chronyd
+      state: restarted
+      enabled: yes
+
+- hosts: client
+  become: true
+  tasks:
+  - name: Creates directory ssh
+    ansible.builtin.file:
+      path: ~root/.ssh
+      state: directory
+      owner: root
+      group: root
+      mode: 0700
+
+  - name: Generate an OpenSSH keypair
+    openssh_keypair:
+      path: /root/.ssh/id_rsa
+      owner: root
+      group: root
+
+  - name: Fix owner of the generated pub key
+    file:
+      path: /root/.ssh/id_rsa.pub
+      owner: root
+      group: root
+
+  - name: copy a file from remote machine to local machine
+    fetch:
+      src: ~root/.ssh/id_rsa.pub
+      dest: id_rsa.pub
+
+  - name: copying config with owner and permissions
+    copy:
+      src: files/config
+      dest: /root/.ssh/config
+      owner: root
+      group: root
+      mode: 0644
+
+- hosts: backup
+  become: true
+  tasks:
+  - name: Create user borg
+    user:
+      name: borg
+      shell: /bin/bash
+      home: /home/borg
+
+  - name: Creates directory ssh
+    ansible.builtin.file:
+      path: ~borg/.ssh
+      state: directory
+      owner: borg
+      group: borg
+      mode: 0700
+
+  - name: Creating keys file
+    file:
+      path: ~borg/.ssh/authorized_keys
+      state: touch
+      mode: 0600
+      owner: borg
+      group: borg
+
+  - name: create new partition
+    parted:
+      label: msdos
+      device: /dev/sdb
+      number: 1
+      state: present
+
+  - name: Create File System
+    filesystem:
+      fstype: ext4
+      dev: /dev/sdb1
+
+  - name: Creates directory backup
+    ansible.builtin.file:
+      path: /var/backup
+      state: directory
+      owner: borg
+      group: borg
+      mode: 0775
+
+  - name: Mount a device
+    mount:
+      path: /var/backup
+      src: /dev/sdb1
+      fstype: ext4
+      state: mounted
+
+  - name: update chmod
+    file:
+      path: /var/backup
+      owner: borg
+      group: borg
+      mode: 0775
+
+
+  - name: Set authorized key taken from file
+    authorized_key:
+      user: borg
+      state: present
+      key: "{{ lookup('file', 'id_rsa.pub/client/root/.ssh/id_rsa.pub') }}"
+
+  - name: Removing folder
+    file:
+      path: /var/backup/lost+found
+      state: absent
+
+- hosts: client
+  become: true
+  tasks:
+  - name: Init borg repo
+    ansible.builtin.shell: borg init --encryption=repokey borg@192.168.56.160:/var/backup/
+    environment:
+        BORG_PASSPHRASE: Otus1234
+
+  - name: copying borg-backup.service
+    copy:
+      src: files/borg-backup.service
+      dest: /etc/systemd/system/borg-backup.service
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: copying borg-backup.timer
+    copy:
+      src: files/borg-backup.timer
+      dest: /etc/systemd/system/borg-backup.timer
+      owner: root
+      group: root
+      mode: 0644
+
+  - name: start borg-backup.timer
+    systemd:
+      name: borg-backup.timer
+      state: started
+      enabled: yes
+
+  - name: start borg-backup.service
+    systemd:
+      name: borg-backup.service
+      state: started
